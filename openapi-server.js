@@ -211,12 +211,51 @@ app.post('/search', async (req, res) => {
                     await runAgentCommand(['--session', sessionId, 'wait', '--load', 'networkidle'], { timeout: 20000 });
                 }, 2);
 
-                // Step 2: Get snapshot to extract search result links
+                // Step 2: Extract search result links using multiple methods
                 console.log('[Search] Step 2: Extracting search result links...');
-                const snapshot = await runAgentCommand(['--session', sessionId, 'snapshot'], { timeout: 10000 });
 
-                // Parse snapshot to find search result links
-                const links = parseSearchResults(snapshot, maxResults);
+                // Method 1: Try to get links directly using CSS selectors
+                let links = [];
+                try {
+                    console.log('[Search] Trying direct link extraction with CSS selectors...');
+
+                    // Try to extract search result links using a CSS selector
+                    // Google search results typically use these selectors
+                    const selectors = [
+                        'div.g a[href]',           // Standard result links
+                        'a[href^="http"]',         // Any http links
+                        'h3 a',                     // Links in h3 headers
+                    ];
+
+                    for (const selector of selectors) {
+                        try {
+                            const linksHtml = await runAgentCommand(
+                                ['--session', sessionId, 'get', 'html', selector],
+                                { timeout: 10000 }
+                            );
+
+                            // Extract URLs from the HTML
+                            const extractedLinks = extractLinksFromHtml(linksHtml, maxResults);
+                            if (extractedLinks.length > 0) {
+                                links = extractedLinks;
+                                console.log(`[Search] Extracted ${links.length} links using selector: ${selector}`);
+                                break;
+                            }
+                        } catch (err) {
+                            console.log(`[Search] Selector ${selector} failed, trying next...`);
+                        }
+                    }
+                } catch (error) {
+                    console.warn('[Search] Direct extraction failed:', error.message);
+                }
+
+                // Method 2: Fallback to snapshot parsing
+                if (links.length === 0) {
+                    console.log('[Search] Falling back to snapshot parsing...');
+                    const snapshot = await runAgentCommand(['--session', sessionId, 'snapshot'], { timeout: 10000 });
+                    links = parseSearchResults(snapshot, maxResults);
+                }
+
                 console.log(`[Search] Found ${links.length} result links`);
 
                 // Step 3: Visit each result page and extract content
@@ -292,31 +331,88 @@ app.post('/search', async (req, res) => {
 });
 
 /**
+ * Extract links from HTML content
+ */
+function extractLinksFromHtml(html, maxResults) {
+    const links = [];
+
+    try {
+        // Extract all href attributes
+        const hrefRegex = /href=["']([^"']+)["']/gi;
+        let match;
+
+        while ((match = hrefRegex.exec(html)) !== null) {
+            const url = match[1];
+
+            // Filter valid URLs
+            if (url.startsWith('http') &&
+                !url.includes('google.com') &&
+                !url.includes('accounts.google') &&
+                !url.includes('support.google') &&
+                !url.includes('policies.google') &&
+                !url.includes('webcache.googleusercontent.com') &&
+                !links.some(l => l.url === url)) {
+
+                // Try to extract title from surrounding text
+                // Look for text between > and <
+                const urlIndex = html.indexOf(match[0]);
+                const afterUrl = html.substring(urlIndex);
+                const titleMatch = afterUrl.match(/>([^<]+)</);
+                const title = titleMatch ? titleMatch[1].trim() : url;
+
+                links.push({ url, title });
+                console.log(`[Search] Extracted: ${title.substring(0, 50)} -> ${url.substring(0, 60)}`);
+
+                if (links.length >= maxResults * 2) {
+                    break;
+                }
+            }
+        }
+    } catch (error) {
+        console.error('[Search] Failed to extract from HTML:', error.message);
+    }
+
+    return links;
+}
+
+/**
  * Parse search results from snapshot
  */
 function parseSearchResults(snapshot, maxResults) {
     const links = [];
 
     try {
+        console.log('[Search] Parsing snapshot (length: ' + snapshot.length + ' chars)');
+
         // Parse the accessibility tree snapshot
         // Looking for links that are likely search results
         const lines = snapshot.split('\n');
+        console.log('[Search] Total lines in snapshot: ' + lines.length);
 
+        // Strategy 1: Look for standard link format with quotes and URLs
         for (const line of lines) {
-            // Look for lines containing URLs
-            // Format is typically: @ref "text" url
-            const urlMatch = line.match(/https?:\/\/[^\s"]+/);
-            const titleMatch = line.match(/"([^"]+)"/);
+            // Try multiple regex patterns for different formats
 
-            if (urlMatch && titleMatch) {
+            // Pattern 1: Standard format - @ref "text" url or "text" url
+            const urlMatch = line.match(/https?:\/\/[^\s"'<>]+/);
+            const titleMatch = line.match(/"([^"]+)"|'([^']+)'/);
+
+            if (urlMatch) {
                 const url = urlMatch[0];
-                const title = titleMatch[1];
+                const title = titleMatch ? (titleMatch[1] || titleMatch[2] || url) : url;
 
-                // Filter out Google's own URLs
+                // Filter out Google's own URLs and common non-result URLs
                 if (!url.includes('google.com') &&
                     !url.includes('accounts.google') &&
-                    !url.includes('support.google')) {
+                    !url.includes('support.google') &&
+                    !url.includes('policies.google') &&
+                    !url.includes('youtube.com/watch') && // Often in ads
+                    !url.startsWith('https://www.google.') &&
+                    url.length > 10 && // Avoid very short URLs
+                    !links.some(l => l.url === url)) { // Avoid duplicates
+
                     links.push({ url, title });
+                    console.log(`[Search] Found link ${links.length}: ${title.substring(0, 50)} -> ${url.substring(0, 60)}`);
 
                     if (links.length >= maxResults * 2) {
                         // Get extra links in case some fail
@@ -324,6 +420,42 @@ function parseSearchResults(snapshot, maxResults) {
                     }
                 }
             }
+        }
+
+        // Strategy 2: If no links found, try to extract from link elements
+        if (links.length === 0) {
+            console.log('[Search] Strategy 1 failed, trying alternative extraction...');
+
+            // Look for lines that contain "link" and a URL
+            for (const line of lines) {
+                if (line.toLowerCase().includes('link')) {
+                    const urlMatch = line.match(/https?:\/\/[^\s"'<>]+/);
+                    if (urlMatch) {
+                        const url = urlMatch[0];
+                        // Extract any text before the URL as title
+                        const textBefore = line.substring(0, line.indexOf(url)).trim();
+                        const title = textBefore || url;
+
+                        if (!url.includes('google.com') &&
+                            !links.some(l => l.url === url)) {
+                            links.push({ url, title });
+                            console.log(`[Search] Alt: Found link ${links.length}: ${url.substring(0, 60)}`);
+
+                            if (links.length >= maxResults * 2) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        console.log(`[Search] Parsing complete: extracted ${links.length} links`);
+
+        // Debug: If still no links, show sample of snapshot for debugging
+        if (links.length === 0) {
+            console.log('[Search] WARNING: No links found! Sample snapshot (first 500 chars):');
+            console.log(snapshot.substring(0, 500));
         }
     } catch (error) {
         console.error('[Search] Failed to parse snapshot:', error.message);

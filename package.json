@@ -3,10 +3,10 @@
     "version": "1.0.0",
     "description": "OpenAPI server for agent-browser integration with Open WebUI",
     "type": "module",
-    "main": "openapi-server.js",
+    "main": "src/server.js",
     "scripts": {
-        "start": "node openapi-server.js",
-        "dev": "node --watch openapi-server.js"
+        "start": "node src/server.js",
+        "dev": "node --watch src/server.js"
     },
     "keywords": [
         "agent-browser",

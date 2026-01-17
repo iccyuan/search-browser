@@ -1,12 +1,86 @@
 /**
  * Parser Utilities
- * HTML and snapshot parsing functions
+ * HTML and snapshot parsing functions optimized for agent-browser refs
  */
 
 import config from '../config/index.js';
 
 /**
- * Extract links from HTML content
+ * Parse snapshot and extract link refs
+ * Uses agent-browser's accessibility tree with refs
+ * @param {string} snapshot - Accessibility tree snapshot
+ * @param {number} maxResults - Maximum number of results
+ * @returns {Array<{ref: string, text: string, url: string}>} - Extracted link refs
+ */
+export function parseSnapshotRefs(snapshot, maxResults) {
+    const links = [];
+
+    try {
+        console.log('[Parser] Parsing snapshot for link refs (length: ' + snapshot.length + ' chars)');
+
+        const lines = snapshot.split('\n');
+        console.log('[Parser] Total lines in snapshot: ' + lines.length);
+
+        // Parse accessibility tree format:
+        // - link "Text" [ref=e1] url
+        // The format is: - <role> "<text>" [ref=<ref>] <url>
+
+        for (const line of lines) {
+            // Look for lines that contain "link" role and a ref
+            if (line.includes('link') && line.includes('[ref=')) {
+                // Extract ref
+                const refMatch = line.match(/\[ref=([^\]]+)\]/);
+                if (!refMatch) continue;
+
+                const ref = refMatch[1];
+
+                // Extract text (between quotes)
+                const textMatch = line.match(/"([^"]+)"/);
+                const text = textMatch ? textMatch[1] : '';
+
+                // Extract URL (after the ref, typically at the end)
+                // Look for http/https URLs
+                const urlMatch = line.match(/https?:\/\/[^\s]+/);
+                const url = urlMatch ? urlMatch[0] : '';
+
+                // Filter out Google's own URLs
+                if (url &&
+                    !url.includes('google.com/search') &&
+                    !url.includes('accounts.google') &&
+                    !url.includes('support.google') &&
+                    !url.includes('policies.google') &&
+                    !url.includes('webcache.googleusercontent.com') &&
+                    !url.includes('youtube.com/watch') &&
+                    !url.startsWith('https://www.google.') &&
+                    url.length > 10 &&
+                    !links.some(l => l.url === url)) {
+
+                    links.push({ ref, text, url });
+                    console.log(`[Parser] Found link ${links.length}: [${ref}] "${text.substring(0, 50)}" -> ${url.substring(0, 60)}`);
+
+                    if (links.length >= maxResults * 2) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        console.log(`[Parser] Parsing complete: extracted ${links.length} link refs`);
+
+        // Debug: If no links found, show sample of snapshot
+        if (links.length === 0) {
+            console.log('[Parser] WARNING: No links found! Sample snapshot (first 1000 chars):');
+            console.log(snapshot.substring(0, 1000));
+        }
+    } catch (error) {
+        console.error('[Parser] Failed to parse snapshot:', error.message);
+    }
+
+    return links;
+}
+
+/**
+ * Extract links from HTML content (fallback method)
  * @param {string} html - HTML content
  * @param {number} maxResults - Maximum number of results to extract
  * @returns {Array<{url: string, title: string}>} - Extracted links
@@ -32,14 +106,13 @@ export function extractLinksFromHtml(html, maxResults) {
                 !links.some(l => l.url === url)) {
 
                 // Try to extract title from surrounding text
-                // Look for text between > and <
                 const urlIndex = html.indexOf(match[0]);
                 const afterUrl = html.substring(urlIndex);
                 const titleMatch = afterUrl.match(/>([^<]+)</);
                 const title = titleMatch ? titleMatch[1].trim() : url;
 
                 links.push({ url, title });
-                console.log(`[Search] Extracted: ${title.substring(0, 50)} -> ${url.substring(0, 60)}`);
+                console.log(`[Parser] Extracted: ${title.substring(0, 50)} -> ${url.substring(0, 60)}`);
 
                 if (links.length >= maxResults * 2) {
                     break;
@@ -47,14 +120,14 @@ export function extractLinksFromHtml(html, maxResults) {
             }
         }
     } catch (error) {
-        console.error('[Search] Failed to extract from HTML:', error.message);
+        console.error('[Parser] Failed to extract from HTML:', error.message);
     }
 
     return links;
 }
 
 /**
- * Parse search results from snapshot
+ * Parse search results from snapshot (legacy method)
  * @param {string} snapshot - Accessibility tree snapshot
  * @param {number} maxResults - Maximum number of results
  * @returns {Array<{url: string, title: string}>} - Parsed links
@@ -63,18 +136,12 @@ export function parseSearchResults(snapshot, maxResults) {
     const links = [];
 
     try {
-        console.log('[Search] Parsing snapshot (length: ' + snapshot.length + ' chars)');
+        console.log('[Parser] Parsing snapshot (length: ' + snapshot.length + ' chars)');
 
-        // Parse the accessibility tree snapshot
-        // Looking for links that are likely search results
         const lines = snapshot.split('\n');
-        console.log('[Search] Total lines in snapshot: ' + lines.length);
+        console.log('[Parser] Total lines in snapshot: ' + lines.length);
 
-        // Strategy 1: Look for standard link format with quotes and URLs
         for (const line of lines) {
-            // Try multiple regex patterns for different formats
-
-            // Pattern 1: Standard format - @ref "text" url or "text" url
             const urlMatch = line.match(/https?:\/\/[^\s"'<>]+/);
             const titleMatch = line.match(/"([^"]+)"|'([^']+)'/);
 
@@ -82,64 +149,33 @@ export function parseSearchResults(snapshot, maxResults) {
                 const url = urlMatch[0];
                 const title = titleMatch ? (titleMatch[1] || titleMatch[2] || url) : url;
 
-                // Filter out Google's own URLs and common non-result URLs
                 if (!url.includes('google.com') &&
                     !url.includes('accounts.google') &&
                     !url.includes('support.google') &&
                     !url.includes('policies.google') &&
-                    !url.includes('youtube.com/watch') && // Often in ads
+                    !url.includes('youtube.com/watch') &&
                     !url.startsWith('https://www.google.') &&
-                    url.length > 10 && // Avoid very short URLs
-                    !links.some(l => l.url === url)) { // Avoid duplicates
+                    url.length > 10 &&
+                    !links.some(l => l.url === url)) {
 
                     links.push({ url, title });
-                    console.log(`[Search] Found link ${links.length}: ${title.substring(0, 50)} -> ${url.substring(0, 60)}`);
+                    console.log(`[Parser] Found link ${links.length}: ${title.substring(0, 50)} -> ${url.substring(0, 60)}`);
 
                     if (links.length >= maxResults * 2) {
-                        // Get extra links in case some fail
                         break;
                     }
                 }
             }
         }
 
-        // Strategy 2: If no links found, try to extract from link elements
+        console.log(`[Parser] Parsing complete: extracted ${links.length} links`);
+
         if (links.length === 0) {
-            console.log('[Search] Strategy 1 failed, trying alternative extraction...');
-
-            // Look for lines that contain "link" and a URL
-            for (const line of lines) {
-                if (line.toLowerCase().includes('link')) {
-                    const urlMatch = line.match(/https?:\/\/[^\s"'<>]+/);
-                    if (urlMatch) {
-                        const url = urlMatch[0];
-                        // Extract any text before the URL as title
-                        const textBefore = line.substring(0, line.indexOf(url)).trim();
-                        const title = textBefore || url;
-
-                        if (!url.includes('google.com') &&
-                            !links.some(l => l.url === url)) {
-                            links.push({ url, title });
-                            console.log(`[Search] Alt: Found link ${links.length}: ${url.substring(0, 60)}`);
-
-                            if (links.length >= maxResults * 2) {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        console.log(`[Search] Parsing complete: extracted ${links.length} links`);
-
-        // Debug: If still no links, show sample of snapshot for debugging
-        if (links.length === 0) {
-            console.log('[Search] WARNING: No links found! Sample snapshot (first 500 chars):');
+            console.log('[Parser] WARNING: No links found! Sample snapshot (first 500 chars):');
             console.log(snapshot.substring(0, 500));
         }
     } catch (error) {
-        console.error('[Search] Failed to parse snapshot:', error.message);
+        console.error('[Parser] Failed to parse snapshot:', error.message);
     }
 
     return links;

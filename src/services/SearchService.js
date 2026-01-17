@@ -1,13 +1,13 @@
 /**
  * Search Service
- * Intelligent search functionality with optimized workflow
+ * Intelligent search functionality with optimized workflow using agent-browser refs
  */
 
 import runAgentCommand from '../core/AgentExecutor.js';
 import { generateSessionId } from '../utils/session.js';
 import { validateUrl } from '../utils/validation.js';
 import { withRetry } from '../utils/retry.js';
-import { extractLinksFromHtml, parseSearchResults, checkRelevance } from '../utils/parser.js';
+import { parseSnapshotRefs, checkRelevance } from '../utils/parser.js';
 import config from '../config/index.js';
 
 /**
@@ -38,7 +38,7 @@ function generateSummary(query, results) {
 }
 
 /**
- * Perform intelligent search with optimized workflow
+ * Perform intelligent search with optimized workflow using refs
  * @param {string} query - Search query
  * @param {number} maxResults - Maximum number of results
  * @returns {Promise<Object>} - Search results with summary
@@ -62,61 +62,81 @@ export async function search(query, maxResults = config.search.defaultMaxResults
         console.log('[Search] Step 2: Waiting for search results to load...');
         await runAgentCommand(['--session', sessionId, 'wait', '--load', 'networkidle'], { timeout: config.timeouts.wait });
 
-        // Step 3: 提取搜索结果返回的链接
-        console.log('[Search] Step 3: Extracting search result links...');
+        // Step 3: 提取搜索结果返回的链接 (使用 snapshot 和 refs - 推荐方法)
+        console.log('[Search] Step 3: Extracting search result links using snapshot refs...');
 
-        // Method 1: Try to get links directly using CSS selectors
         try {
-            console.log('[Search] Trying direct link extraction with CSS selectors...');
+            // Use interactive snapshot to get only interactive elements (links, buttons, etc.)
+            // This is the recommended approach for agent-browser
+            const snapshot = await runAgentCommand(
+                ['--session', sessionId, 'snapshot', '-i'],
+                { timeout: config.timeouts.extract }
+            );
 
-            // Google search results typically use these selectors
-            const selectors = [
-                'div.g a[href]',           // Standard result links
-                'a[href^="http"]',         // Any http links
-                'h3 a',                     // Links in h3 headers
-            ];
+            // Parse snapshot to extract link refs
+            links = parseSnapshotRefs(snapshot, maxResults);
+            console.log(`[Search] Extracted ${links.length} link refs from snapshot`);
 
-            for (const selector of selectors) {
-                try {
-                    const linksHtml = await runAgentCommand(
-                        ['--session', sessionId, 'get', 'html', selector],
-                        { timeout: config.timeouts.extract }
-                    );
+            // If no links found with refs, try compact snapshot
+            if (links.length === 0) {
+                console.log('[Search] No links found with interactive snapshot, trying compact snapshot...');
+                const compactSnapshot = await runAgentCommand(
+                    ['--session', sessionId, 'snapshot', '-c'],
+                    { timeout: config.timeouts.extract }
+                );
+                links = parseSnapshotRefs(compactSnapshot, maxResults);
+                console.log(`[Search] Extracted ${links.length} link refs from compact snapshot`);
+            }
 
-                    // Extract URLs from the HTML
-                    const extractedLinks = extractLinksFromHtml(linksHtml, maxResults);
-                    if (extractedLinks.length > 0) {
-                        links = extractedLinks;
-                        console.log(`[Search] Extracted ${links.length} links using selector: ${selector}`);
-                        break;
-                    }
-                } catch (err) {
-                    console.log(`[Search] Selector ${selector} failed, trying next...`);
-                }
+            // If still no links, try full snapshot
+            if (links.length === 0) {
+                console.log('[Search] No links found with compact snapshot, trying full snapshot...');
+                const fullSnapshot = await runAgentCommand(
+                    ['--session', sessionId, 'snapshot'],
+                    { timeout: config.timeouts.extract }
+                );
+                links = parseSnapshotRefs(fullSnapshot, maxResults);
+                console.log(`[Search] Extracted ${links.length} link refs from full snapshot`);
             }
         } catch (error) {
-            console.warn('[Search] Direct extraction failed:', error.message);
-        }
-
-        // Method 2: Fallback to snapshot parsing
-        if (links.length === 0) {
-            console.log('[Search] Falling back to snapshot parsing...');
-            const snapshot = await runAgentCommand(['--session', sessionId, 'snapshot'], { timeout: config.timeouts.extract });
-            links = parseSearchResults(snapshot, maxResults);
+            console.warn('[Search] Snapshot extraction failed:', error.message);
         }
 
         console.log(`[Search] Found ${links.length} result links`);
+
+        if (links.length === 0) {
+            console.warn('[Search] No search result links found. Returning empty results.');
+            return {
+                query,
+                results: [],
+                totalFound: 0,
+                relevantCount: 0,
+                summary: generateSummary(query, [])
+            };
+        }
 
         // Steps 4-8: 依次点击链接、等待加载、提取内容、检查相关性
         for (let i = 0; i < Math.min(links.length, maxResults * 2); i++) {
             const link = links[i];
 
-            // Step 4: 点击第一个/下一个链接
-            console.log(`[Search] Step 4.${i + 1}: Clicking link ${i + 1}: ${link.url}...`);
+            // Step 4: 点击链接 (使用 ref 或直接打开 URL)
+            console.log(`[Search] Step 4.${i + 1}: Navigating to link ${i + 1}: ${link.url}...`);
 
             try {
-                // Navigate to the result page (using open instead of click for reliability)
-                await runAgentCommand(['--session', sessionId, 'open', link.url], { timeout: config.timeouts.open });
+                // Method 1: Try to click using ref (if available)
+                if (link.ref) {
+                    try {
+                        console.log(`[Search] Clicking link using ref: @${link.ref}`);
+                        await runAgentCommand(['--session', sessionId, 'click', `@${link.ref}`], { timeout: config.timeouts.open });
+                    } catch (refError) {
+                        console.log(`[Search] Click by ref failed, falling back to direct URL open`);
+                        // Fallback to direct URL open
+                        await runAgentCommand(['--session', sessionId, 'open', link.url], { timeout: config.timeouts.open });
+                    }
+                } else {
+                    // Method 2: Direct URL open (fallback)
+                    await runAgentCommand(['--session', sessionId, 'open', link.url], { timeout: config.timeouts.open });
+                }
 
                 // Step 5: 智能等待页面加载完成
                 console.log(`[Search] Step 5.${i + 1}: Waiting for page to load...`);
@@ -124,7 +144,7 @@ export async function search(query, maxResults = config.search.defaultMaxResults
 
                 // Step 6: 提取页面内容
                 console.log(`[Search] Step 6.${i + 1}: Extracting page content...`);
-                const title = await runAgentCommand(['--session', sessionId, 'get', 'title'], { timeout: config.timeouts.extract }).catch(() => link.title);
+                const title = await runAgentCommand(['--session', sessionId, 'get', 'title'], { timeout: config.timeouts.extract }).catch(() => link.text || link.url);
                 const content = await runAgentCommand(['--session', sessionId, 'get', 'text', 'body'], { timeout: config.timeouts.extract });
 
                 // Extract first 500 characters as snippet
@@ -136,7 +156,7 @@ export async function search(query, maxResults = config.search.defaultMaxResults
 
                 if (isRelevant) {
                     results.push({
-                        title: title.trim() || link.title,
+                        title: title.trim() || link.text || link.url,
                         url: link.url,
                         snippet: snippet,
                         relevance: 'high',
